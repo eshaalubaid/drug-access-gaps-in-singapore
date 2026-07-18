@@ -1,0 +1,564 @@
+---
+title: "FDA-HSA Combined Pipeline"
+author: "Eshaal Ubaid"
+date: "2026-06-09"
+output: html_document
+---
+```{r}
+#SETUP
+library(tidyverse)
+library(rio)
+library(readxl)
+library(rvest)
+
+#downloading registries, ATC code list, WHO special drug designations lists, and other info like registration dates
+
+hsa <- import("Data/HSA_Drugs.csv")
+atc <- import("Data/WHO ATC-DDD 2026-04-25.csv")
+eml <- read_excel("Data/eml_export.xlsx")
+rare_raw <- read_html("Data/Rare Drugs.xls") |> html_table() |> pluck(1)
+fda_products <- import("Data/Products.txt")
+fda_apps <- import("Data/Applications.txt")
+fda_subs <- import("Data/Submissions.txt")
+```
+
+```{r}
+#REGEX FOR NORMALIZATION (a list of normalization checks that has been refined over multiple drug registries to use for cleaning later)
+salt_strip_pattern <- regex(paste0("\\b(",
+  paste(c("hydrochloride","hcl","hydrobromide","hbr","hydroiodide","bromide",
+          "chloride","iodide","fluoride","sodium","potassium","calcium","magnesium",
+          "lithium","zinc","aluminum","sulfate","sulphate","phosphate","nitrate",
+          "carbonate","bicarbonate","acetate","benzoate","citrate","fumarate",
+          "maleate","malate","mesylate","besylate","tartrate","tosylate","oxalate",
+          "pamoate","succinate","gluconate","lactate","aspartate","glutamate",
+          "edisylate","napsylate","embonate","isethionate","camsylate",
+          "stearate","valerate","propionate","caproate","decanoate","enanthate",
+          "cypionate","undecanoate","palmitate","dipropionate","acetonide","furoate",
+          "monohydrate","dihydrate","trihydrate","tetrahydrate","pentahydrate",
+          "hydrate","anhydrous","trometamol","tromethamine","monoacetate","base",
+          "heptahydrate","hexahydrate","bitartrate","subcitrate","subsalicylate",
+          "tebutate","dibasic","monobasic","glacial","micronized",
+          "bisulfate","bisulphate","hemifumarate","hemihydrate","hemisulfate",
+          "xinafoate","olamine","saccharate","nicotinate","propylene",
+          "dihcl","dihbr","dihydrochloride","dihydrobromide","trihydrochloride","tetrahydrochloride","sesquihydrate", #di/tri/tetra-prefix salts and sesqui hydrate, surfaced by 100-row spot check
+          #SALT ADDITIONS from naming convention audit:
+          "ditosylate","tosilate","trisodium", #valbenazine ditosylate, edoxaban tosilate, foscarnet trisodium
+          "ethylsuccinate", #erythromycin ethylsuccinate — ester salt; NOT stripping "mepesuccinate" since WHO ATC L5 name for omacetaxine IS "omacetaxine mepesuccinate" (the mepesuccinate is part of the INN)
+          "butylbromide","hydrogenbromide","mononitrate","polistirex", #hyoscine butylbromide, thiamine mononitrate, dextromethorphan polistirex (ion-exchange resin)
+          "epolamine","diethylamine","diethylammonium", #diclofenac salt variants
+          "tromethamol", #UK INN spelling of tromethamine
+          "ethanesulfonate","methanesulfonate","benzenesulfonate", #US-style spellings of esylate / mesylate / besylate
+          "methylsulfate","methylsulphate", #neostigmine methylsulfate variant
+          #SALT ADDITIONS from QA audit (June 2026):
+          "dimaleate","diphosphate","diacetate", #afatinib dimaleate, DES diphosphate, diflorasone diacetate — di-prefix ester/acid salts not previously covered
+          "disodium","dipotassium","dimesylate","mesylates","ditromethamine","diacid", #di-cation salts + plural mesylate: consolidates ceftriaxone/methotrexate/fosfomycin/valsartan/pemetrexed disodium, pemetrexed dipotassium, netarsudil dimesylate, ergoloid mesylates with their bare-substance rows
+          "hemipentahydrate", #risedronate hemipentahydrate — crystalline hydrate form not in the hydrate series
+          "fumaric", #siponimod fumaric acid — counterion acid form (complement to fumarate already present); phrase "fumaric acid" handled below before this strip
+          "free", #desmopressin free / raltegravir free / donepezil free base — form descriptor; "free acid"/"free base" stripped as phrases first
+          "sulfoxide"), #dimethyl sulfoxide (DMSO solvent excipient on HSA trametinib labels)
+        collapse = "|"),
+  ")\\b"), ignore_case = TRUE)
+#DOSE FORM / PHARMACOPOEIA / ROUTE noise — mostly relevant on the HSA side (FDA's ActiveIngredient column is cleaner), but harmless on FDA too.
+dose_form_pattern <- regex(paste0("\\b(",
+  paste(c("tablet","tablets","capsule","capsules","syrup","suspension","injection","infusion","cream","ointment",
+          "gel","drops","drop","paste","lozenge","lozenges","powder","solution","suppository","suppositories",
+          "spray","inhaler","patch","lotion","emulsion","granules","elixir","implant","pellets","pellet",
+          "sachets","sachet","enema","aerosol","nebuliser","nebulizer","liquid","wafer","gargle","mouthwash",
+          "shampoo","wash","foam","plaster","film","coated","release","extended","modified","sustained",
+          "controlled","prolonged","delayed","immediate","enteric","gastro","resistant","sugar","chewable",
+          "effervescent","oral","topical","sublingual","buccal","ophthalmic","otic","dermal","nasal",
+          "inhalation","rectal","vaginal","intramuscular","intravenous","subcutaneous",
+          "ip","bp","usp","ep","jp","nf",
+          "human","veterinary","paediatric","pediatric",
+          #DESCRIPTOR / EXCIPIENT NOISE from naming convention audit:
+          "hypromellose","lactose", #"vemurafenib in hypromellose", "cyanocobalamin in lactose" — diluent excipients listed inside the active string
+          "absolute","milled","microcrystalline","ultramicrosize", #grade / particle-size descriptors
+          "chimeric","adsorbed", #biologic descriptors ("cetuximab chimeric antibody", "diphtheria toxoid adsorbed")
+          "elemental","phenol","precipitate","hyd","vial","hydrous", #form / process descriptors leftover on HSA labels
+          "recombinant","rdna", #insulin convention drift — FDA uses "recombinant", HSA uses "rdna"; strip both so the lispro/glargine/etc base name unifies
+          "bht","bhq","bha"), #antioxidant excipients (BHT=butylated hydroxytoluene); HSA labels for everolimus (Afinitor/Votubia) list "+0.2% BHT" as a stabiliser inside the active string
+        collapse = "|"),
+  ")\\b"), ignore_case = TRUE)
+synonym_replacements <- c("\\bacetaminophen\\b"     = "paracetamol",
+                          "\\balbuterol\\b"          = "salbutamol",
+                          "\\bepinephrine\\b"        = "adrenaline",
+                          "\\bnorepinephrine\\b"     = "noradrenaline",
+                          "\\bglyburide\\b"          = "glibenclamide",
+                          "\\bmeperidine\\b"         = "pethidine",
+                          "\\bfurosemide\\b"         = "frusemide",
+                          "\\bacyclovir\\b"          = "aciclovir",
+                          "\\bvalacyclovir\\b"       = "valaciclovir",
+                          "\\baspirin\\b"            = "acetylsalicylic acid",
+                          "\\bcephalexin\\b"         = "cefalexin",
+                          "\\bcephradine\\b"         = "cefradine",
+                          "\\brifampin\\b"           = "rifampicin",
+                          "\\bchlorpheniramine\\b"   = "chlorphenamine",
+                          "\\bbeclomethasone\\b"     = "beclometasone",
+                          "\\bcyclosporin\\b"        = "ciclosporin",
+                          "\\bchlorthalidone\\b"     = "chlortalidone",
+                          "\\bsulphamethoxazole\\b"  = "sulfamethoxazole",
+                          "\\boestradiol\\b"         = "estradiol",
+                          "\\boestrogen\\b"          = "estrogen",
+                          "\\blignocaine\\b"         = "lidocaine",
+                          "\\baluminium\\b"          = "aluminum",
+                          "\\bscopolamine\\b"        = "hyoscine",
+                          "\\bdibucaine\\b"          = "cinchocaine",
+                          "\\bleuprolide\\b"         = "leuprorelin",
+                          "\\bmesalamine\\b"         = "mesalazine",
+                          #VITAMIN NAME → INN
+                          "\\bvitamin\\s*a\\b"           = "retinol",
+                          "\\bvitamin\\s*b\\s*1\\b"      = "thiamine",
+                          "\\bvitamin\\s*b\\s*2\\b"      = "riboflavin",
+                          "\\bvitamin\\s*b\\s*3\\b"      = "nicotinamide",
+                          "\\bvitamin\\s*b\\s*5\\b"      = "pantothenic acid",
+                          "\\bvitamin\\s*b\\s*6\\b"      = "pyridoxine",
+                          "\\bvitamin\\s*b\\s*9\\b"      = "folic acid",
+                          "\\bvitamin\\s*b\\s*12\\b"     = "cyanocobalamin",
+                          "\\bvitamin\\s*c\\b"           = "ascorbic acid",
+                          "\\bvitamin\\s*d\\s*3\\b"      = "colecalciferol",
+                          "\\bvitamin\\s*d\\s*2\\b"      = "ergocalciferol",
+                          "\\bvitamin\\s*d\\b"           = "colecalciferol",
+                          "\\bvitamin\\s*e\\b"           = "tocopherol",
+                          "\\bvitamin\\s*k\\s*1\\b"      = "phytomenadione",
+                          "\\bvitamin\\s*k\\b"           = "phytomenadione",
+                          "\\balpha\\s+tocopherol\\b"    = "tocopherol",
+                          #UK / older INN spellings
+                          "\\bphenobarbitone\\b"         = "phenobarbital",
+                          "\\bamylobarbitone\\b"         = "amobarbital",
+                          "\\bquinalbarbitone\\b"        = "secobarbital",
+                          "\\bsulphadiazine\\b"          = "sulfadiazine",
+                          "\\bsulphasalazine\\b"         = "sulfasalazine",
+                          "\\baminosidine\\b"            = "paromomycin",
+                          "\\bindomethacin\\b"           = "indometacin",
+                          "\\bdimethicone\\b"            = "dimeticone",
+                          "\\bmethicillin\\b"            = "meticillin",
+                          "\\bcholecalciferol\\b"        = "colecalciferol",
+                          "\\bnaphthazoline\\b"          = "naphazoline",
+                          "\\bspiramycine\\b"            = "spiramycin",
+                          "\\bbenzyl\\s+penicillin\\b"          = "benzylpenicillin",
+                          "\\bphenoxymethyl\\s+penicillin\\b"   = "phenoxymethylpenicillin",
+                          "\\bpenicillin\\s*v\\b"               = "phenoxymethylpenicillin", #common shorthand on HSA-side labels
+                          "\\bpenicillin\\s*g\\b"               = "benzylpenicillin",
+                          "\\bbenzhexol\\b"                     = "trihexyphenidyl", #UK/Bangladesh name (BNF) for the same INN
+                          "\\bpantothenate\\b"                  = "pantothenic acid", #FDA writes "pantothenic acid", HSA writes "pantothenate" — same vitamin B5
+                          #OCR / typo corrections
+                          "\\bhci\\b"                    = "hcl",
+                          "\\bhbri\\b"                   = "hbr",
+                          "\\bchlorhidate\\b"            = "chlorhydrate",
+                          #INN PROTECTION: protect two-word INNs before salt_strip sees "fumarate" / "maleate" etc.
+                          # dimethyl fumarate → fused token "dimethylfumarate" is immune to \bfumarate\b; restored after all stripping.
+                          "\\bdimethyl\\s+fumarate\\b"   = "dimethylfumarate",
+                          #BRITISH/VARIANT SPELLINGS (HSA-side labels)
+                          "\\bguaiphenesin\\b"           = "guaifenesin",
+                          #ALTERNATE NAMES → INN
+                          # acetyl aspartyl glutamic acid (AAGA salt) — HSA label variant for spaglumic acid (S01GX03, antiallergic ophthalmic)
+                          "\\bacetyl\\s+aspartyl\\s+glutamic\\s+acid(\\s+salt)?\\b" = "spaglumic acid")
+normalize_ingredient <- function(x) { x |>
+    str_replace_all("\u03b1", "alpha ") |> # U+03B1 alpha. \\u escape is encoding-safe; the literal-char pattern was misread under non-UTF8 R locales, letting raw alpha through (e.g. "... alpha tocopherol")
+    str_replace_all("\u03b2", "beta ") |>  # U+03B2 beta
+    str_replace_all("\u03b3", "gamma ") |> # U+03B3 gamma
+    str_replace_all("\u03b4", "delta ") |> # U+03B4 delta
+    str_replace_all("\u03bc|\u00b5", "u") |> # U+03BC Greek mu + U+00B5 micro sign -> "u" so "ug"/microgram forms reduce and get caught by the unit strip below (fixes "fentanyl ug", "romiplostim ug")
+    str_to_lower() |>
+    # Insert spaces at letter→digit and digit→letter boundaries so \b-based
+    # patterns can match "2HCl" (→ "2 hcl") and "HBR20" (→ "hbr 20").
+    str_replace_all("(?<=[a-z])(\\d)", " \\1") |>
+    str_replace_all("(?<=\\d)([a-z])", " \\1") |>
+    str_replace_all("\\ba-(?=[a-z]{4,})", "alpha-") |>
+    str_replace_all("\\bb-(?=[a-z]{4,})", "beta-") |>
+    str_replace_all(synonym_replacements) |>
+    str_replace_all("\\(.*?\\)", " ") |>
+    str_replace_all("\\bor\\b", " ") |> #"entrectinib (Form A) or (Form C)" → after parens stripped, "or" would remain as a noise word
+    str_replace_all("\\beq\\.?\\s*to\\b", " ") |>
+    str_replace_all("\\bequ\\.?(\\s+to)?\\b", " ") |> #"irinotecan equ to" — HSA-side abbreviation not covered by eqv/equiv patterns
+    str_replace_all("\\b(eqv|eqvt|equv)\\.?(\\s*to)?\\b", " ") |> #catches "eqv", "eqvt", "equv" — three abbreviations of equivalent that all appear on HSA labels
+    str_replace_all("\\bequiv(alent)?(\\s+to)?\\b", " ") |>
+    str_replace_all("\\bcorrespond(s|ing)?\\s+to\\b", " ") |> #also catches "corresponding to" (perindopril arginine HSA label uses this form)
+    str_replace_all("\\bas\\b", " ") |>
+    str_replace_all("\\bfor\\b", " ") |>
+    str_replace_all("\\bin\\b", " ") |> #"vemurafenib in hypromellose" — "in" is a preposition linking the API to its excipient carrier; safe to strip as no INN contains standalone "in" as a word
+    str_replace_all("\\b\\d+(\\.\\d+)?\\s*(mg|mcg|µg|ug|g|ml|l|%|w/v|v/v|w/w|iu|units?|mol)(\\s*/\\s*\\w+)?\\b", " ") |>
+    str_replace_all("\\b(mg|mcg|µg|ug|ml|iu|units?|mol|dose)\\b", " ") |>
+    str_replace_all("-[a-z]{4}\\b", " ") |>
+    str_replace_all("\\bbesilate\\b", "besylate") |>
+    str_replace_all("\\bmesilate\\b", "mesylate") |>
+    str_replace_all("\\bsulphate\\b", "sulfate") |>
+    str_replace_all("\\bsulphide\\b", "sulfide") |>
+    # Strip multi-word salt/solvent phrases BEFORE single-word salt_strip so we don't
+    # accidentally strip half a two-word INN.  "fumaric acid" → space (then the lone
+    # "fumaric" / "acid" tokens are harmless remnants caught by salt/digit strips below).
+    str_replace_all(regex("\\b(dimethyl sulfoxide|fumaric acid|maleic acid|free acid|free base)\\b", ignore_case = TRUE), " ") |>
+    str_replace_all(salt_strip_pattern, " ") |>
+    str_replace_all(dose_form_pattern, " ") |>
+    # Restore the protected INN token to its canonical two-word form AFTER all
+    # stripping is complete, so it matches WHO ATC "dimethyl fumarate" (L04AX07).
+    str_replace_all("\\bdimethylfumarate\\b", "dimethyl fumarate") |>
+    str_replace_all("\\b(io\\w+)\\s+iodine\\b", "\\1") |> #iodinated contrast agents — HSA appends "iodine" to clarify iodine-containing actives (iohexol iodine, iopromide iodine). drop the trailing "iodine" only when the preceding word starts with "io".
+    str_replace_all("[[:punct:]]", " ") |>
+    str_replace_all("\\d+", " ") |>
+    str_squish() |>
+    str_replace_all("\\b([lnd]|cis|trans|r|s)\\s+(?=\\w{3,})", " ") |>
+    str_squish() |>
+    str_split("\\s+") |>
+    map_chr(~ paste(unique(.x), collapse = " "))}
+```
+
+```{r}
+#the actual ATC matching pipeline
+atc_l5_lookup <- atc |>
+  filter(nchar(atc_code) == 7) |>
+  distinct(atc_code, atc_name) |>
+  mutate(name_norm = normalize_ingredient(atc_name)) |>
+  filter(nchar(name_norm) >= 3,
+         !name_norm %in% c("combinations","other combinations"))
+
+#updating the ATC checks based on new info (this set should ideally be updated over time as changes are made in the WHO)
+atc_remap <- c(
+  # Kinase inhibitors: L01XE* → L01E* subclasses (2021 reorganisation)
+  "L01XE01"="L01EA01","L01XE02"="L01EB01","L01XE04"="L01EX01","L01XE05"="L01EX02",
+  "L01XE06"="L01EA02","L01XE08"="L01EA03","L01XE10"="L01EG02","L01XE11"="L01EX03",
+  "L01XE13"="L01EB03","L01XE15"="L01EC01","L01XE16"="L01ED01","L01XE17"="L01EK01",
+  "L01XE21"="L01EX05","L01XE31"="L01EX09","L01XE33"="L01EF01","L01XE35"="L01EB04",
+  "L01XE36"="L01ED03","L01XE43"="L01ED04","L01XE44"="L01ED05","L01XE47"="L01EB07",
+  "L01XE56"="L01EX14","L01EX17"="L01EP01","L01EX21"="L01EP02",
+  # Monoclonal antibodies: L01XC* → L01F* subclasses
+  "L01XC02"="L01FA01","L01XC03"="L01FD01","L01XC05"="L01FX02","L01XC08"="L01FE02",
+  "L01XC11"="L01FX04","L01XC12"="L01FX05","L01XC14"="L01FD03","L01XC17"="L01FF01",
+  "L01XC18"="L01FF02","L01XC19"="L01FX07","L01XC21"="L01FG02","L01XC24"="L01FC01",
+  "L01XC28"="L01FF03","L01XC31"="L01FF04","L01XC38"="L01FC02","L01XY03"="L01FY02",
+  # Other oncology reclassifications
+  "L01XX14"="L01XF01","L01XX19"="L01CE02","L01XX32"="L01XG01",
+  "L01XX50"="L01XG03","L01XX60"="L01XK04",
+  # Immunosuppressants: L04AA* → L04A* subclasses
+  "L04AA11"="L04AB01","L04AA13"="L04AK01","L04AA18"="L04AH02","L04AA27"="L04AE01",
+  "L04AA29"="L04AF01","L04AA33"="L04AG05","L04AA34"="L04AG06","L04AA37"="L04AF02",
+  "L04AA42"="L04AE03","L04AA44"="L04AF03","N07XX09"="L04AX07",
+  # Neurology reclassifications
+  "N03AX12"="N02BF01","N03AX16"="N02BF02","N02CX07"="N02CD01","N02CX08"="N02CD02",
+  "N02AX52"="N02AJ13",
+  # Cardiology / haematology / pulmonary
+  # NOTE: B03AC01 (ferric carboxymaltose) has NO valid L5 in WHO ATC 2026 — B03AC series
+  # exists only at L4 level; removed from remap so the code stays as-is rather than map to
+  # a nonexistent code.
+  "B01AX06"="B01AF01","J06BB16"="J06BD01",
+  "R03AK03"="R03AL01", # fenoterol+ipratropium — moved from R03AK (fixed combos) to new R03AL class
+  # Antivirals
+  "J05AF30"="J05AR02","J05AX08"="J05AJ01","J05AX12"="J05AJ03",
+  # GI / metabolism
+  "A03AE04"="A06AX05","A10BX07"="A10BJ02","A10BX12"="A10BK03",
+  # Ophthalmology fluoroquinolones
+  "S01AX13"="S01AE03","S01AX19"="S01AE05","S01AX21"="S01AE06","S01AX22"="S01AE07",
+  # Typo corrections (wrong digit prefix, confirmed not reclassifications)
+  "A01BA02"="A10BA02","A20BB09"="A10BB09")
+
+#creating and filtering the FDA set
+fda_orig_approvals <- fda_subs |>
+  filter(SubmissionType == "ORIG", SubmissionStatus == "AP") |>
+  group_by(ApplNo) |>
+  summarise(fda_orig_approval = min(as.Date(SubmissionStatusDate), na.rm = TRUE), .groups = "drop")
+filtereddrugs <- merge(fda_apps, fda_products, by.x = "ApplNo", by.y = "ApplNo") |>
+  filter(ApplType %in% c("NDA", "BLA")) |>
+  left_join(fda_orig_approvals, by = "ApplNo") |> #carries fda_orig_approval through the rest of the pipeline
+  select(fda_app_no = ApplNo,
+         fda_DrugName = DrugName,
+         fda_ActiveIngredient = ActiveIngredient,
+         fda_LicenseHolder = SponsorName,
+         fda_orig_approval) |>
+  mutate(fda_id = row_number())
+
+#put fda_id and ingredient into one row to normalize 
+drugs_long <- filtereddrugs |>
+  mutate(.row_id = fda_id,
+         .ing_split = str_split(fda_ActiveIngredient, ";\\s*|\\s+AND\\s+")) |> #split on both ";" and "AND" 
+  unnest_longer(.ing_split) |>
+  mutate(ing_raw  = str_squish(.ing_split),
+         ing_norm = normalize_ingredient(ing_raw)) |>
+  filter(nchar(ing_norm) >= 3)
+
+#two passes of matching: exact normalized and then first-word 
+pass1 <- drugs_long |>
+  inner_join(atc_l5_lookup, by = c("ing_norm" = "name_norm")) |>
+  select(.row_id, ing_norm, atc_code) |> distinct()
+remaining <- drugs_long |> anti_join(distinct(pass1, .row_id, ing_norm), by = c(".row_id", "ing_norm"))
+pass2 <- remaining |>
+  mutate(first_word = str_extract(ing_norm, "^[a-z0-9-]+")) |>
+  inner_join(atc_l5_lookup, by = c("first_word" = "name_norm")) |>
+  select(.row_id, ing_norm, atc_code) |> distinct()
+fda_matches <- bind_rows(pass1, pass2) |>
+  rename(atc_level5 = atc_code) |>
+  mutate(atc_level5 = if_else(atc_level5 %in% names(atc_remap),
+                              atc_remap[atc_level5], atc_level5))
+fda <- filtereddrugs |>
+  inner_join(fda_matches, by = c("fda_id" = ".row_id")) |>
+  select(fda_id, fda_app_no, fda_DrugName, fda_ActiveIngredient,
+         fda_LicenseHolder, fda_orig_approval, atc_level5,
+         fda_matched_ing = ing_norm)
+cat(sprintf("FDA matched: %d (drug, ATC) pairs spanning %d unique fda_ids\n",
+            nrow(fda), n_distinct(fda$fda_id)))
+```
+
+```{r}
+#polish the FDA set
+fda <- fda |>
+  select(-any_of("Unnamed: 0")) |>
+  filter(!is.na(fda_id))
+```
+
+```{r}
+#fixing the hsa set which has some Pending values too
+fix_atc <- function(x) {
+  x <- str_to_upper(str_trim(as.character(x)))
+  x <- if_else(str_detect(x, "(?i)^pending$"), NA_character_, x)
+  ok7 <- !is.na(x) & nchar(x) == 7
+  #transposition fixes like JA5AR10 to J05AR10 thank you for pointing this out claude
+  if (any(ok7, na.rm = TRUE)) {
+    s <- x[ok7]
+    s <- gsub("^([A-Z])([A-Z])(\\d)([A-Z]{2}\\d{2})$", "\\10\\3\\4", s)
+    x[ok7] <- s
+  }
+  if (any(ok7, na.rm = TRUE)) {
+    s <- x[ok7]
+    for (pos in c(2, 3, 6, 7)) {
+      substr(s, pos, pos) <- str_replace(substr(s, pos, pos), "O", "0")
+    }
+    x[ok7] <- s
+  }
+  x
+}
+
+hsa <- hsa |>
+  select(hsa_reg_no = licence_no,
+         hsa_DrugName = product_name,
+         hsa_reg_date = approval_d,
+         hsa_ATC = atc_code,
+         hsa_ActiveIngredient = active_ingredients,
+         hsa_LicenseHolder = license_holder) |>
+  mutate(hsa_ATC = fix_atc(hsa_ATC),
+         hsa_ATC = if_else(!is.na(hsa_ATC) & hsa_ATC %in% names(atc_remap),
+                           atc_remap[hsa_ATC], hsa_ATC),
+         atc_level5 = if_else(nchar(hsa_ATC) == 7, hsa_ATC, NA_character_))
+```
+
+```{r}
+#one row per ATC code
+fda <- fda |>
+  mutate(.name_key = str_to_lower(str_squish(fda_DrugName))) |>
+  distinct(.name_key, atc_level5, .keep_all = TRUE) |>
+  select(-.name_key)
+hsa <- hsa |>
+  filter(!is.na(atc_level5)) |>
+  mutate(.name_key = str_to_lower(str_squish(hsa_DrugName))) |>
+  distinct(.name_key, atc_level5, .keep_all = TRUE) |>
+  select(-.name_key)
+```
+
+```{r}
+#merge!
+merged <- full_join(fda,
+                    hsa |> select(-hsa_ATC),
+                    by = "atc_level5") |>
+  mutate(atc_level3 = substr(atc_level5, 1, 4),
+         gaps = if_else(!is.na(fda_id) & is.na(hsa_reg_no), "YES", "NO"))
+```
+
+```{r}
+#creating classifications based on ATC code
+atc_classes <- atc |> distinct(atc_code, atc_name) |> filter(!is.na(atc_code))
+name_for <- setNames(atc_classes$atc_name, atc_classes$atc_code)
+merged <- merged |>
+  mutate(`Therapeutic Class`        = name_for[substr(atc_level5, 1, 1)],
+         `Mechanism of Action`      = name_for[substr(atc_level5, 1, 3)],
+         `Pharmacological Subgroup` = name_for[substr(atc_level5, 1, 4)],
+         `Chemical Subgroup`        = name_for[substr(atc_level5, 1, 5)],
+         Substance                  = name_for[atc_level5])
+```
+
+```{r}
+#creating a metric that measures uniqueness by brand, aka how many different companies offer this one drug
+brand_counts <- bind_rows(
+  fda |> distinct(atc_level5, brand = as.character(fda_id)),
+  hsa |> filter(!is.na(atc_level5)) |> distinct(atc_level5, brand = as.character(hsa_reg_no))
+) |>
+  group_by(atc_level5) |>
+  summarise(no_alternatives = n(), .groups = "drop") |>
+  mutate(alternative_uniqueness = ntile(no_alternatives, 5))
+merged <- merged |>
+  left_join(brand_counts, by = "atc_level5")
+```
+
+```{r}
+#essential medicines list
+eml_l5 <- eml |>
+  filter(Status == "Added") |>
+  filter(!is.na(`ATC codes`)) |>
+  mutate(.codes = str_split(`ATC codes`, ",\\s*")) |>
+  unnest_longer(.codes) |>
+  mutate(.codes = str_trim(.codes)) |>
+  filter(nchar(.codes) == 7) |>
+  distinct(.codes) |> pull(.codes)
+merged <- merged |> mutate(is_on_who_eml = atc_level5 %in% eml_l5)
+# ---- 8. Rare/orphan flag (two-pass fuzzy match, same scheme as FDA matcher) ----
+rare <- rare_raw |>
+  rename(generic = `Generic Name`) |>
+  mutate(.id = row_number(),
+         g_norm  = normalize_ingredient(generic),
+         g_first = str_extract(g_norm, "^[a-z0-9-]+"))
+p1 <- rare |> inner_join(atc_l5_lookup, by = c("g_norm" = "name_norm")) |> select(.id, atc_code)
+p2 <- rare |> anti_join(distinct(p1, .id), by = ".id") |>
+  inner_join(atc_l5_lookup, by = c("g_first" = "name_norm")) |> select(.id, atc_code)
+orphan_l5 <- bind_rows(p1, p2) |> pull(atc_code) |> unique()
+merged <- merged |> mutate(is_rare = atc_level5 %in% orphan_l5)
+
+#also just fixing this cosmetic thing
+merged <- merged |> relocate(atc_level5, atc_level3, .before = 1)
+```
+
+```{r}
+#DUPLICATE FIXES + dealing with the ATC combinations classifier which doesn't really tell me anything
+
+merged <- merged |>
+  filter(is.na(Substance) | Substance != "combinations")
+# (b) Identify any substance that exists in HSA under ANY atc_level5
+substance_in_hsa <- merged |>
+  filter(!is.na(hsa_reg_no), !is.na(Substance)) |>
+  pull(Substance) |>
+  unique()
+
+merged <- merged |>
+  mutate(gaps = if_else(gaps == "YES" & Substance %in% substance_in_hsa,
+                        "NO", gaps))
+multi_atc_subs <- merged |>
+  filter(!is.na(Substance)) |>
+  group_by(Substance) |>
+  summarise(n_atc = n_distinct(atc_level5), .groups = "drop") |>
+  filter(n_atc > 1) |>
+  pull(Substance)
+merged <- merged |>
+  mutate(DUP = if_else(Substance %in% multi_atc_subs, "DUP", "UNIQUE"))
+merged <- merged |>
+  select(-any_of(c("atc_level3", "V1"))) |>
+  select(atc_level5, gaps, `Therapeutic Class`, `Mechanism of Action`, `Pharmacological Subgroup`, `Chemical Subgroup`, Substance, is_on_who_eml, is_rare, no_alternatives, alternative_uniqueness, fda_id, fda_app_no, fda_DrugName, fda_ActiveIngredient, fda_matched_ing, fda_LicenseHolder, fda_orig_approval, hsa_reg_no, hsa_DrugName, hsa_reg_date, hsa_ActiveIngredient, hsa_LicenseHolder, DUP)
+write.csv(merged,
+          "/Users/eshaal/Library/CloudStorage/Box-Box/Singapore FDA-HDA Product Spec/FDA_HSA Raw.csv",
+          row.names = FALSE)
+cat(sprintf("\nRaw dataset: %d rows x %d cols\n", nrow(merged), ncol(merged)))
+```
+
+```{r}
+#INGREDIENT-LEVEL PASS (was V3) — reuses the same normalize_ingredient and synonym dict above. Works on the in-memory `merged` from the chunk above; no round-trip through the CSV needed.
+data <- merged |>
+  select(-gaps, -no_alternatives, -alternative_uniqueness) |> #removing past metrics, removing gaps for now to redo them meticulously, kept the eml and rare matches because those were atc based anyway
+  filter(!str_detect(atc_level5, regex("pending", ignore_case = TRUE))) #some weird error from the last set leaves PENDING rows (i think R used as a placeholder for empty ATC rows, not 100% sure)
+data$fda_ActiveIngredient <- toupper(data$fda_ActiveIngredient) #fixing case so it doesn't bite me in the ass
+data$hsa_ActiveIngredient <- toupper(data$hsa_ActiveIngredient)
+#ACTUAL SEPARATION - one row per (active ingredient × source), normalized through the shared function.
+fda_long <- data |>
+  filter(!is.na(fda_matched_ing)) |>
+  # came_from_combo still derived from the raw FDA string (fda_ActiveIngredient) which
+  # contains the original multi-ingredient text before any splitting or normalisation.
+  mutate(came_from_combo = str_detect(fda_ActiveIngredient, ";|\\s+AND\\s+")) |>
+  # Use fda_matched_ing (the normalised ingredient that was actually matched to this
+  # atc_level5 in the FDA-ATC join) instead of re-splitting fda_ActiveIngredient.
+  # Re-splitting here would re-assign ALL co-ingredient ATC codes to every ingredient
+  # in the combo — the ingredient-level contamination that fda_matched_ing eliminates.
+  transmute(ingredient = fda_matched_ing,
+            source = "fda",
+            came_from_combo,
+            atc_level5,
+            `Therapeutic Class`, `Mechanism of Action`, `Pharmacological Subgroup`, `Chemical Subgroup`, Substance,
+            fda_id, fda_DrugName, fda_LicenseHolder, fda_app_no, fda_orig_approval,
+            is_rare, is_on_who_eml) |>
+  filter(nchar(ingredient) >= 3)
+hsa_long <- data |>
+  filter(!is.na(hsa_ActiveIngredient)) |>
+  mutate(came_from_combo = str_detect(hsa_ActiveIngredient, "&&")) |>
+  separate_rows(hsa_ActiveIngredient, sep = "&&") |>
+  transmute(ingredient = normalize_ingredient(hsa_ActiveIngredient),
+            source = "hsa",
+            came_from_combo,
+            atc_level5,
+            `Therapeutic Class`, `Mechanism of Action`, `Pharmacological Subgroup`, `Chemical Subgroup`, Substance,
+            hsa_reg_no, hsa_DrugName, hsa_LicenseHolder, hsa_reg_date,
+            is_rare, is_on_who_eml) |>
+  filter(nchar(ingredient) >= 3)
+data_long <- bind_rows(fda_long, hsa_long) #hurrah
+```
+
+```{r}
+#GAPS METRIC — at the ingredient level (one row per ingredient). same six-category scheme you had in V3, kept for the FDA-HSA two-country comparison.
+# ---- ATC COMBINATION-CODE CLEANUP --------------------------------------------------------------
+# A WHO combination L5 code (its name contains " and " / "combinations" / " with ") gets inherited by
+# EVERY component when an HSA combo product is split — e.g. amlodipine inheriting C09BB04
+# ("perindopril and amlodipine"). We drop those combo codes from an ingredient's code/substance/class
+# rollups, but ONLY when the ingredient also has its own single-substance code, so combo-only actives
+# (clavulanate, carbidopa, cilastatin, avibactam, …) keep theirs. The has/alone/combo FLAGS below are
+# still computed over ALL rows, so the gap labels are UNCHANGED — this only cleans ATC-code attribution.
+combo_l5 <- atc |>
+  filter(nchar(atc_code) == 7,
+         str_detect(str_to_lower(atc_name), "\\band\\b|combinations?|,\\s*comb|\\swith\\s")) |>
+  pull(atc_code) |> unique()
+data_long <- data_long |>
+  group_by(ingredient) |>
+  mutate(.keep_code = !(atc_level5 %in% combo_l5) | all(atc_level5 %in% combo_l5)) |> #keep non-combo codes; keep combo codes only if the ingredient is combo-only
+  ungroup()
+data_long = data_long |>
+  group_by(ingredient) |>
+  summarise(has_fda   = any(source == "fda"),
+            has_hsa   = any(source == "hsa"),
+            alone_fda = any(source == "fda" & !came_from_combo),
+            alone_hsa = any(source == "hsa" & !came_from_combo),
+            combo_fda = any(source == "fda" &  came_from_combo),
+            combo_hsa = any(source == "hsa" &  came_from_combo),
+            atc_codes = paste(sort(unique(atc_level5[.keep_code])), collapse = " | "),
+            `Therapeutic Class`        = paste(sort(unique(na.omit(`Therapeutic Class`[.keep_code]))),        collapse = " | "),
+            `Mechanism of Action`      = paste(sort(unique(na.omit(`Mechanism of Action`[.keep_code]))),      collapse = " | "),
+            `Pharmacological Subgroup` = paste(sort(unique(na.omit(`Pharmacological Subgroup`[.keep_code]))), collapse = " | "),
+            `Chemical Subgroup`        = paste(sort(unique(na.omit(`Chemical Subgroup`[.keep_code]))),        collapse = " | "),
+            Substance                  = paste(sort(unique(na.omit(Substance[.keep_code]))),                  collapse = " | "),
+            fda_brands = paste(sort(unique(na.omit(fda_DrugName))), collapse = " | "),
+            hsa_brands = paste(sort(unique(na.omit(hsa_DrugName))), collapse = " | "),
+            fda_earliest_approval = suppressWarnings(min(fda_orig_approval, na.rm = TRUE)), #earliest FDA approval across all brands of this active. suppressWarnings hides the "no non-missing args" warning that fires for HSA_ONLY ingredients (no FDA brand → no date).
+            fda_latest_approval   = suppressWarnings(max(fda_orig_approval, na.rm = TRUE)), #most recent FDA approval for the same ingredient (e.g. biosimilar / new indication / new salt). useful for trend storylines.
+            hsa_earliest_approval = suppressWarnings(min(as.Date(hsa_reg_date), na.rm = TRUE)), #earliest HSA registration. mirror of fda_earliest_approval — same suppressWarnings rationale for FDA_ONLY ingredients.
+            hsa_latest_approval   = suppressWarnings(max(as.Date(hsa_reg_date), na.rm = TRUE)), #most recent HSA registration — useful for "is this drug actively being added in Singapore" type questions.
+            is_rare = any(is_rare, na.rm = TRUE),
+            is_on_who_eml = any(is_on_who_eml, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(gaps = case_when(has_fda & !has_hsa ~ "FDA_ONLY",
+                          !has_fda & has_hsa ~ "HSA_ONLY",
+                          alone_fda & alone_hsa ~ "NO GAP",
+                          alone_fda & !alone_hsa & combo_hsa ~ "PARTIAL GAP (FDA STANDALONE)",
+                          !alone_fda & alone_hsa & combo_fda ~ "PARTIAL HSA (HSA STANDALONE)",
+                          combo_fda & combo_hsa ~ "NO GAP",
+                          TRUE ~ "RECLASSIFY"))
+unique(data_long$gaps)
+table(data_long$gaps)
+write.csv(data_long, "/Users/eshaal/Library/CloudStorage/Box-Box/Singapore FDA-HDA Product Spec/FDA_HSA By Actives V1.csv", row.names = FALSE)
+```
+
+```{r}
+#now we make it look good
+names(data_long)
+cosmetics <- data_long |>
+  select(-alone_fda, -alone_hsa, -has_fda, -has_hsa, -combo_fda, -combo_hsa, -fda_earliest_approval, -hsa_earliest_approval) |>
+  rename(`Active Ingredient` = ingredient,
+    `ATC Codes` = atc_codes,
+    `Therapeutic Class (L1)` = `Therapeutic Class`,
+    `Drug Class (L2)` = `Mechanism of Action`,
+    `Pharmacological Subgroup (L3)` = `Pharmacological Subgroup`,
+    `Chemical Subgroup (L4)` = `Chemical Subgroup`,
+    `Substance (L5)` = Substance,
+    `FDA Drug Name` = fda_brands,
+    `HSA Drug Name` = hsa_brands,
+    `Last FDA Approval` = fda_latest_approval,
+    `Last HSA Approval` = hsa_latest_approval,
+    `Rare/Orphan Drug` = is_rare,
+    `WHO Essential Drug` = is_on_who_eml,
+    `Availability` = gaps) 
+
+cosmetics$`Last FDA Approval`[cosmetics$`Last FDA Approval` %in% c("Inf", "-Inf", "NaN")] <- NA
+cosmetics$`Last HSA Approval`[cosmetics$`Last HSA Approval` %in% c("Inf", "-Inf")] <- NA
+
+write.csv(cosmetics, "Result/Access Gap Mapping Pipeline.csv", row.names = FALSE)
+```
+
